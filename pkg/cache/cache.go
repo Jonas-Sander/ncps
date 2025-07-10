@@ -233,14 +233,75 @@ func (c *Cache) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadClose
 		zerolog.Ctx(ctx).WithContext(c.baseContext),
 		trace.SpanFromContext(ctx),
 	)
-	doneC := c.prePullNar(detachedCtx, &narURL, nil, nil, false)
+	// If the nar is not in store, attempt to stream it from upstream.
+	// The first request will initiate the stream and store it.
+	// Subsequent requests for the same NAR while it's being streamed/stored
+	// will wait for the first request to complete and then get it from the store.
+	c.muUpstreamJobs.Lock()
+	jobDoneC, jobInProgress := c.upstreamJobs[narURL.Hash]
+	if jobInProgress {
+		c.muUpstreamJobs.Unlock()
+		zerolog.Ctx(ctx).Info().Msg("NAR download already in progress, waiting for it to complete")
+		<-jobDoneC // Wait for the existing job to finish
+		zerolog.Ctx(ctx).Info().Msg("In-progress NAR download finished, now serving from store")
+		return c.getNarFromStore(ctx, &narURL)
+	}
 
-	zerolog.Ctx(ctx).
-		Debug().
-		Msg("pulling nar in a go-routing and will wait for it")
-	<-doneC
+	// Create a new channel to signal completion of this job
+	newJobDoneC := make(chan struct{})
+	c.upstreamJobs[narURL.Hash] = newJobDoneC
+	c.muUpstreamJobs.Unlock()
 
-	return c.getNarFromStore(ctx, &narURL)
+	// Ensure the job is removed from the map and the channel is closed when done
+	defer func() {
+		c.muUpstreamJobs.Lock()
+		delete(c.upstreamJobs, narURL.Hash)
+		c.muUpstreamJobs.Unlock()
+		close(newJobDoneC)
+	}()
+
+	zerolog.Ctx(ctx).Info().Msg("NAR not in store, attempting to stream from upstream")
+
+	// Get the NAR from upstream
+	// create a detachedCtx that has the same span and logger as the main
+	// context but with the baseContext as parent; This context will not cancel
+	// when ctx is canceled allowing us to continue pulling the nar in the
+	// background.
+	detachedCtx := trace.ContextWithSpan(
+		zerolog.Ctx(ctx).WithContext(c.baseContext),
+		trace.SpanFromContext(ctx),
+	)
+	upstreamResp, selectedUC, narInfoFromUpstream, err := c.initiateNarDownloadFromUpstream(detachedCtx, &narURL, nil, nil, false)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			zerolog.Ctx(ctx).Info().Msg("NAR not found in upstream")
+		} else {
+			zerolog.Ctx(ctx).Error().Err(err).Msg("failed to initiate NAR download from upstream")
+		}
+		return 0, nil, err // Propagate storage.ErrNotFound or other errors
+	}
+
+	// Use TeeReader to stream to client and save to store simultaneously
+	// server.go will be reading from teeToClientReader
+	// storeNarInBackground will be reading from storeReader (which is fed by teeToClientReader)
+	storeReader, teeToClientReader := io.Pipe()
+	tee := io.TeeReader(upstreamResp.Body, storeReader)
+
+	// Goroutine to store the NAR in the background
+	go func() {
+		defer upstreamResp.Body.Close() // Close the original upstream response body when TeeReader is done
+		defer storeReader.Close()       // Close the writer part of the pipe
+
+		// Determine if ZSTD compression was applied during download for narInfo update
+		enableZSTD := narURL.Compression == nar.CompressionTypeZstd && narInfoFromUpstream != nil && narInfoFromUpstream.Compression != nar.CompressionTypeZstd.String()
+
+		// Pass selectedUC and narInfoFromUpstream if available
+		c.storeNarFromStream(detachedCtx, &narURL, io.NopCloser(tee), upstreamResp.ContentLength, selectedUC, narInfoFromUpstream, enableZSTD)
+	}()
+
+	// Return the TeeReader for the client to read from, and the content length from the upstream response
+	zerolog.Ctx(ctx).Info().Msg("Streaming NAR from upstream to client and storing in background")
+	return upstreamResp.ContentLength, io.NopCloser(teeToClientReader), nil
 }
 
 // PutNar records the NAR (given as an io.Reader) into the store.
@@ -814,12 +875,88 @@ func (c *Cache) prePullNar(
 
 	c.muUpstreamJobs.Lock()
 
-	doneC, ok := c.upstreamJobs[narURL.Hash]
-	if !ok {
+	doneC, jobInProgress := c.upstreamJobs[narURL.Hash]
+	if !jobInProgress {
 		doneC = make(chan struct{})
 		c.upstreamJobs[narURL.Hash] = doneC
+		// Launch pullNar in a goroutine. pullNar itself will handle unregistering the job
+		// by closing doneC and removing from upstreamJobs map is NOT done by pullNar directly.
+		// prePullNar's caller (e.g. GetNar or pullNarInfo) is responsible for the job lifecycle
+		// in upstreamJobs map.
+		// pullNar is responsible for closing the doneC channel it's given.
+		go func() {
+			// This goroutine is responsible for eventually closing doneC via pullNar's defer.
+			// It also needs to remove the job from the map once pullNar is fully complete.
+			// This was previously missing and could lead to stale entries if pullNar errored early.
+			// However, GetNar now has its own defer to clean up its jobs.
+			// pullNar, when called from pullNarInfo, needs a similar cleanup wrapper if prePullNar
+			// is responsible for adding to upstreamJobs.
+			defer func() {
+				c.muUpstreamJobs.Lock()
+				// Only delete if this instance of prePullNar was the one that created it.
+				// This check is imperfect if another request for the same hash comes in fractionally later
+				// and gets the same doneC.
+				// A robust way is for pullNar to signal actual completion (not just starting store).
+				// For now, pullNar closes doneC. The job map cleanup for prePullNar-initiated jobs
+				// needs to be handled carefully.
+				// The GetNar path handles its own job removal.
+				// For pullNarInfo->prePullNar->pullNar:
+				// pullNarInfo waits on doneC. Once doneC is closed, pullNarInfo proceeds.
+				// The job entry in upstreamJobs should be removed then.
+				// The current structure of pullNar closing doneC works for signaling.
+				// The map cleanup for jobs started by prePullNar (for pullNarInfo) is the main concern here.
 
-		go c.pullNar(ctx, narURL, uc, narInfo, enableZSTD, doneC)
+				// Let's simplify: pullNar is given doneC and is responsible for closing it.
+				// The management of upstreamJobs (add/delete) should be symmetric.
+				// If prePullNar adds it, it (or its context) should remove it.
+
+				// Current pullNar closes doneC.
+				// GetNar adds/removes its own entries from upstreamJobs.
+				// prePullNar (for pullNarInfo) adds to upstreamJobs. The corresponding remove is missing.
+				// Let's add the remove here, after pullNar finishes (indicated by doneC closing).
+				// This means we need to wait for doneC here IF this goroutine created the job.
+				// This is getting complicated.
+				// Simpler: The entity that adds to upstreamJobs is responsible for removing.
+				// GetNar does this.
+				// For prePullNar (used by pullNarInfo):
+				// pullNarInfo calls prePullNar, which adds the job and starts pullNar.
+				// pullNarInfo waits on the returned doneC.
+				// After doneC is closed (pullNar finished/errored), pullNarInfo should remove the job.
+				// This is not how it's currently structured. prePullNarInfo doesn't get access to muUpstreamJobs.
+
+				// Let's stick to the original logic for prePullNar for now: it adds the job,
+				// pullNar closes doneC. The job removal for these types of jobs was implicit
+				// via GetNar if it was the one checking, or never happened if only pullNarInfo
+				// triggered it.
+				// The defer in pullNar now closes doneC.
+				// The map c.upstreamJobs[narURL.Hash] = doneC is the key.
+				// The responsibility of removing narURL.Hash from c.upstreamJobs needs to be clear.
+				// Option 1: pullNar removes it before closing doneC. (done in pullNar's main path, not defer)
+				// Option 2: The caller of prePullNar removes it after <-doneC. (requires exposing map or a new func)
+				// Option 3: The goroutine started by prePullNar removes it after pullNar returns.
+
+				// The `defer close(doneC)` is IN `pullNar`.
+				// The `defer delete` is IN `GetNar`.
+				// For `prePullNar` usage (by `pullNarInfo`), the `delete` is missing.
+				// Let's add it to the goroutine launched by `prePullNar`.
+				c.pullNar(ctx, narURL, uc, narInfo, enableZSTD, doneC) // pullNar will close doneC
+
+				// After pullNar completes (i.e., doneC is closed), remove the job from the map.
+				// This ensures that if prePullNar initiated the job, it's also responsible for cleaning it up from the map.
+				c.muUpstreamJobs.Lock()
+				// Check if the job is still ours before deleting, though not perfectly race-proof.
+				// If another GetNar came for the same hash and found this job, it would wait.
+				// If this pullNar finishes, GetNar would then try to get from store.
+				// If this pullNar failed and another GetNar came, it might start a new job.
+				currentJob, stillExists := c.upstreamJobs[narURL.Hash]
+				if stillExists && currentJob == doneC { // only remove if it's the same channel instance
+					delete(c.upstreamJobs, narURL.Hash)
+				}
+				c.muUpstreamJobs.Unlock()
+			}()
+		}()
+	} else {
+		zerolog.Ctx(ctx).Info().Msg("NAR download job already in progress, joining wait")
 	}
 	c.muUpstreamJobs.Unlock()
 
