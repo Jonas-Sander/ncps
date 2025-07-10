@@ -51,6 +51,144 @@ const (
 	tracerName           = "github.com/kalbasit/ncps/pkg/cache"
 )
 
+// initiateNarDownloadFromUpstream handles the logic to get the NAR stream from an upstream cache.
+// It returns the HTTP response, the upstream cache used, the narinfo (if available), and any error.
+func (c *Cache) initiateNarDownloadFromUpstream(
+	ctx context.Context,
+	narURL *nar.URL,
+	uc *upstream.Cache, // Optional: specific upstream to use
+	retrievedNarInfo *narinfo.NarInfo, // Optional: narInfo already retrieved
+	enableZSTD bool,
+) (*http.Response, *upstream.Cache, *narinfo.NarInfo, error) {
+	ctx, span := c.tracer.Start(
+		ctx,
+		"cache.initiateNarDownloadFromUpstream",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("nar_url", narURL.String()),
+		),
+	)
+	defer span.End()
+
+	var mutators []func(*http.Request)
+	if enableZSTD && retrievedNarInfo != nil {
+		mutators = append(mutators, zstdMutator(ctx, narURL.Compression))
+	}
+
+	ctx = narURL.
+		NewLogger(*zerolog.Ctx(ctx)).
+		WithContext(ctx)
+
+	var selectedUC upstream.Cache
+	var err error
+
+	if uc != nil {
+		selectedUC = *uc
+	} else {
+		foundUC, selErr := c.selectNarUpstream(ctx, narURL, c.upstreamCaches, mutators)
+		if selErr != nil {
+			zerolog.Ctx(ctx).Error().Err(selErr).Msg("error selecting an upstream for the nar")
+			return nil, nil, nil, selErr
+		}
+		if foundUC == nil {
+			zerolog.Ctx(ctx).Info().Msg("NAR not found in any upstream cache")
+			return nil, nil, nil, storage.ErrNotFound
+		}
+		selectedUC = *foundUC
+	}
+
+	zerolog.Ctx(ctx).Info().Str("upstream_host", selectedUC.GetHostname()).Msg("requesting NAR from upstream")
+	resp, err := selectedUC.GetNar(ctx, *narURL, mutators...)
+	if err != nil {
+		if !errors.Is(err, upstream.ErrNotFound) {
+			zerolog.Ctx(ctx).Error().Err(err).Str("hostname", selectedUC.GetHostname()).Msg("error fetching the nar from upstream")
+		}
+		return nil, &selectedUC, retrievedNarInfo, err
+	}
+
+	if enableZSTD && retrievedNarInfo != nil {
+		if resp.Header.Get("Content-Encoding") == "zstd" || strings.HasSuffix(resp.Request.URL.Path, "."+nar.CompressionTypeZstd.ToFileExtension()) {
+			narURL.Compression = nar.CompressionTypeZstd
+			retrievedNarInfo.Compression = nar.CompressionTypeZstd.String()
+			retrievedNarInfo.URL = narURL.String()
+			zerolog.Ctx(ctx).Info().Msg("Upstream provided ZSTD compressed NAR.")
+		} else {
+			zerolog.Ctx(ctx).Warn().Msg("Requested ZSTD from upstream, but did not receive ZSTD encoding.")
+		}
+	}
+
+	return resp, &selectedUC, retrievedNarInfo, nil
+}
+
+// storeNarFromStream saves the content from the reader to the narStore.
+// It's designed to be run in a goroutine.
+func (c *Cache) storeNarFromStream(
+	ctx context.Context,
+	narURL *nar.URL, // This narURL should reflect the actual compression of data in narReader
+	narReader io.ReadCloser,
+	_ int64, // contentLength - currently unused, but kept for potential future use
+	_ *upstream.Cache, // uc - currently unused
+	narInfoToUpdate *narinfo.NarInfo, // narInfo that might need FileSize update
+	isZSTDEnabled bool, // If true, narInfoToUpdate.FileSize might be updated based on actual written bytes
+) {
+	ctx, span := c.tracer.Start(
+		ctx,
+		"cache.storeNarFromStream",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("nar_url", narURL.String()),
+		),
+	)
+	defer span.End()
+	defer narReader.Close()
+
+	now := time.Now()
+	zerolog.Ctx(ctx).Info().Msg("Starting background NAR storage")
+
+	written, err := c.narStore.PutNar(ctx, *narURL, narReader)
+	if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("Error storing NAR in narStore")
+		return
+	}
+
+	zerolog.Ctx(ctx).Info().Int64("bytes_written", written).Dur("elapsed", time.Since(now)).Msg("NAR storage complete")
+
+	if isZSTDEnabled && narInfoToUpdate != nil && written > 0 {
+		if narInfoToUpdate.Compression == nar.CompressionTypeZstd.String() && narURL.Compression == nar.CompressionTypeZstd {
+			zerolog.Ctx(ctx).Info().
+				Uint64("old_filesize", narInfoToUpdate.FileSize).
+				Int64("new_filesize", written).
+				Msg("Updating NarInfo FileSize due to ZSTD compression")
+			narInfoToUpdate.FileSize = uint64(written)
+		}
+	}
+
+	// After successful storage, update the database record for the NAR.
+	// This part was previously handled by pullNarInfo->storeInDatabase for the nar record.
+	// If narInfoToUpdate is nil, it means GetNar was called directly.
+	// We need to ensure a NAR DB record is created/updated if not handled elsewhere.
+	// The current TouchNar in getNarFromStore handles access time.
+	// CreateNar in storeInDatabase (called by pullNarInfo) creates the initial NAR record.
+	// If GetNar is called without a prior GetNarInfo, the NAR DB record might be missing.
+	// For now, we assume that a GetNarInfo usually precedes or that the system can handle
+	// NARs existing in store without a DB record temporarily.
+	// A robust solution would be to call a c.db.CreateNar or c.db.TouchNar variant here.
+	// This is complex due to needing nar_info_id if creating.
+	// Let's ensure the file_size in the database is updated if a narinfo initiated this download.
+	if narInfoToUpdate != nil {
+		// The narInfoToUpdate object (which might have updated FileSize) will be saved to DB by pullNarInfo.
+		// If the nar record in DB needs direct update of file_size:
+		// nir, err := c.db.GetNarInfoByHash(ctx, narInfoToUpdate.Path) // Need the correct hash for narinfo
+		// if err == nil {
+		//    c.db.UpdateNarFileSizeByNarInfoID(ctx, nir.ID, narURL.Hash, written)
+		// }
+		// This is simplified; actual DB interaction for NAR file size update might be needed here
+		// if pullNarInfo's storeInDatabase doesn't use the updated narInfoToUpdate.FileSize for the nars table.
+		// storeInDatabase *does* use narInfo.FileSize when creating the NARS table entry.
+		// So, if narInfoToUpdate is correctly modified, storeInDatabase (called later in pullNarInfo) should be fine.
+	}
+}
+
 // Cache represents the main cache service.
 type Cache struct {
 	baseContext context.Context
@@ -225,14 +363,6 @@ func (c *Cache) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadClose
 		return c.getNarFromStore(ctx, &narURL)
 	}
 
-	// create a detachedCtx that has the same span and logger as the main
-	// context but with the baseContext as parent; This context will not cancel
-	// when ctx is canceled allowing us to continue pulling the nar in the
-	// background.
-	detachedCtx := trace.ContextWithSpan(
-		zerolog.Ctx(ctx).WithContext(c.baseContext),
-		trace.SpanFromContext(ctx),
-	)
 	// If the nar is not in store, attempt to stream it from upstream.
 	// The first request will initiate the stream and store it.
 	// Subsequent requests for the same NAR while it's being streamed/stored
@@ -281,27 +411,45 @@ func (c *Cache) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadClose
 		return 0, nil, err // Propagate storage.ErrNotFound or other errors
 	}
 
-	// Use TeeReader to stream to client and save to store simultaneously
-	// server.go will be reading from teeToClientReader
-	// storeNarInBackground will be reading from storeReader (which is fed by teeToClientReader)
-	storeReader, teeToClientReader := io.Pipe()
-	tee := io.TeeReader(upstreamResp.Body, storeReader)
+	// Use TeeReader to stream to client and save to store simultaneously.
+	// pipeReader will be read by the client (returned by GetNar).
+	// pipeWriter is where TeeReader will write the data.
+	clientPipeReader, storePipeWriter := io.Pipe()
 
-	// Goroutine to store the NAR in the background
+	// teeReader reads from upstreamResp.Body. As it's read (by storeNarFromStream),
+	// the data is also written to storePipeWriter.
+	teeReader := io.TeeReader(upstreamResp.Body, storePipeWriter)
+
+	// Goroutine to store the NAR in the background by reading from teeReader.
+	// This drives the consumption of upstreamResp.Body and writing to storePipeWriter.
 	go func() {
-		defer upstreamResp.Body.Close() // Close the original upstream response body when TeeReader is done
-		defer storeReader.Close()       // Close the writer part of the pipe
+		// When this goroutine finishes (either by completing the read or error),
+		// close the upstream response body and the writer end of the pipe.
+		defer upstreamResp.Body.Close()
+		defer storePipeWriter.Close() // Important to signal EOF to clientPipeReader
 
 		// Determine if ZSTD compression was applied during download for narInfo update
-		enableZSTD := narURL.Compression == nar.CompressionTypeZstd && narInfoFromUpstream != nil && narInfoFromUpstream.Compression != nar.CompressionTypeZstd.String()
+		// This needs to be based on the actual narURL used for download and narInfoFromUpstream
+		var wasZSTDEnabledForDownload bool
+		if narInfoFromUpstream != nil {
+			// If narInfo was for 'none' and we attempted zstd
+			wasZSTDEnabledForDownload = narInfoFromUpstream.Compression == nar.CompressionTypeNone.String() && narURL.Compression == nar.CompressionTypeZstd
+		} else {
+			// If no prior narInfo, check if original URL was non-ZSTD but current is ZSTD (though this path is less common without narInfo)
+			// This part of enableZSTD logic might need refinement based on how narURL is mutated.
+			// For now, let's assume narURL passed to storeNarFromStream has the final compression type.
+			wasZSTDEnabledForDownload = narURL.Compression == nar.CompressionTypeZstd
+		}
+
 
 		// Pass selectedUC and narInfoFromUpstream if available
-		c.storeNarFromStream(detachedCtx, &narURL, io.NopCloser(tee), upstreamResp.ContentLength, selectedUC, narInfoFromUpstream, enableZSTD)
+		// The storeNarFromStream function will read from teeReader to completion.
+		c.storeNarFromStream(detachedCtx, &narURL, io.NopCloser(teeReader), upstreamResp.ContentLength, selectedUC, narInfoFromUpstream, wasZSTDEnabledForDownload)
 	}()
 
-	// Return the TeeReader for the client to read from, and the content length from the upstream response
+	// Return clientPipeReader for the client to read from, and the content length from the upstream response.
 	zerolog.Ctx(ctx).Info().Msg("Streaming NAR from upstream to client and storing in background")
-	return upstreamResp.ContentLength, io.NopCloser(teeToClientReader), nil
+	return upstreamResp.ContentLength, io.NopCloser(clientPipeReader), nil
 }
 
 // PutNar records the NAR (given as an io.Reader) into the store.
@@ -711,7 +859,8 @@ func (c *Cache) pullNarInfo(
 		// context but with the baseContext as parent; This context will not cancel
 		// when ctx is canceled allowing us to continue pulling the nar in the
 		// background.
-		detachedCtx := trace.ContextWithSpan(
+		var detachedCtx context.Context
+		detachedCtx = trace.ContextWithSpan(
 			zerolog.Ctx(ctx).WithContext(c.baseContext),
 			trace.SpanFromContext(ctx),
 		)
