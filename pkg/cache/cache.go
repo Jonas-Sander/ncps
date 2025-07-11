@@ -97,6 +97,10 @@ func (c *Cache) initiateNarDownloadFromUpstream(
 		selectedUC = *foundUC
 	}
 
+	if retrievedNarInfo == nil {
+		zerolog.Ctx(ctx).Warn().Msg("initiating NAR download without prior narinfo; DB records may be incomplete")
+	}
+
 	zerolog.Ctx(ctx).Info().Str("upstream_host", selectedUC.GetHostname()).Msg("requesting NAR from upstream")
 	resp, err := selectedUC.GetNar(ctx, *narURL, mutators...)
 	if err != nil {
@@ -121,15 +125,11 @@ func (c *Cache) initiateNarDownloadFromUpstream(
 }
 
 // storeNarFromStream saves the content from the reader to the narStore.
-// It's designed to be run in a goroutine.
 func (c *Cache) storeNarFromStream(
 	ctx context.Context,
-	narURL *nar.URL, // This narURL should reflect the actual compression of data in narReader
+	narURL *nar.URL,
 	narReader io.ReadCloser,
-	_ int64, // contentLength - currently unused, but kept for potential future use
-	_ *upstream.Cache, // uc - currently unused
-	narInfoToUpdate *narinfo.NarInfo, // narInfo that might need FileSize update
-	isZSTDEnabled bool, // If true, narInfoToUpdate.FileSize might be updated based on actual written bytes
+	narInfoToUpdate *narinfo.NarInfo, // Can be nil
 ) {
 	ctx, span := c.tracer.Start(
 		ctx,
@@ -153,39 +153,53 @@ func (c *Cache) storeNarFromStream(
 
 	zerolog.Ctx(ctx).Info().Int64("bytes_written", written).Dur("elapsed", time.Since(now)).Msg("NAR storage complete")
 
-	if isZSTDEnabled && narInfoToUpdate != nil && written > 0 {
-		if narInfoToUpdate.Compression == nar.CompressionTypeZstd.String() && narURL.Compression == nar.CompressionTypeZstd {
-			zerolog.Ctx(ctx).Info().
-				Uint64("old_filesize", narInfoToUpdate.FileSize).
-				Int64("new_filesize", written).
-				Msg("Updating NarInfo FileSize due to ZSTD compression")
-			narInfoToUpdate.FileSize = uint64(written)
-		}
+	if narInfoToUpdate == nil {
+		zerolog.Ctx(ctx).Warn().Msg("storeNarFromStream called without narInfo; skipping database update.")
+		return
 	}
 
-	// After successful storage, update the database record for the NAR.
-	// This part was previously handled by pullNarInfo->storeInDatabase for the nar record.
-	// If narInfoToUpdate is nil, it means GetNar was called directly.
-	// We need to ensure a NAR DB record is created/updated if not handled elsewhere.
-	// The current TouchNar in getNarFromStore handles access time.
-	// CreateNar in storeInDatabase (called by pullNarInfo) creates the initial NAR record.
-	// If GetNar is called without a prior GetNarInfo, the NAR DB record might be missing.
-	// For now, we assume that a GetNarInfo usually precedes or that the system can handle
-	// NARs existing in store without a DB record temporarily.
-	// A robust solution would be to call a c.db.CreateNar or c.db.TouchNar variant here.
-	// This is complex due to needing nar_info_id if creating.
-	// Let's ensure the file_size in the database is updated if a narinfo initiated this download.
-	if narInfoToUpdate != nil {
-		// The narInfoToUpdate object (which might have updated FileSize) will be saved to DB by pullNarInfo.
-		// If the nar record in DB needs direct update of file_size:
-		// nir, err := c.db.GetNarInfoByHash(ctx, narInfoToUpdate.Path) // Need the correct hash for narinfo
-		// if err == nil {
-		//    c.db.UpdateNarFileSizeByNarInfoID(ctx, nir.ID, narURL.Hash, written)
-		// }
-		// This is simplified; actual DB interaction for NAR file size update might be needed here
-		// if pullNarInfo's storeInDatabase doesn't use the updated narInfoToUpdate.FileSize for the nars table.
-		// storeInDatabase *does* use narInfo.FileSize when creating the NARS table entry.
-		// So, if narInfoToUpdate is correctly modified, storeInDatabase (called later in pullNarInfo) should be fine.
+	if narInfoToUpdate.Compression == nar.CompressionTypeZstd.String() && written > 0 {
+		narInfoToUpdate.FileSize = uint64(written)
+	}
+
+	tx, err := c.db.DB().Begin()
+	if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("storeNarFromStream: failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	qtx := c.db.WithTx(tx)
+	narinfoHash := strings.TrimPrefix(narInfoToUpdate.StorePath, "/nix/store/")
+	narinfoHash = strings.SplitN(narinfoHash, "-", 2)[0]
+
+	dbNarInfo, err := qtx.GetNarInfoByHash(ctx, narinfoHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		dbNarInfo, err = qtx.CreateNarInfo(ctx, narinfoHash)
+		if err != nil {
+			zerolog.Ctx(ctx).Error().Err(err).Str("narinfo_hash", narinfoHash).Msg("storeNarFromStream: failed to create narinfo record")
+			return
+		}
+	} else if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Str("narinfo_hash", narinfoHash).Msg("storeNarFromStream: failed to get narinfo record")
+		return
+	}
+
+	_, err = qtx.CreateNar(ctx, database.CreateNarParams{
+		NarInfoID:   dbNarInfo.ID,
+		Hash:        narURL.Hash,
+		Compression: narURL.Compression.String(),
+		Query:       narURL.Query.Encode(),
+		FileSize:    narInfoToUpdate.FileSize,
+	})
+
+	if err != nil && !database.ErrorIsNo(err, sqlite3.ErrConstraint) {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("storeNarFromStream: failed to create nar record")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("storeNarFromStream: failed to commit transaction")
 	}
 }
 
@@ -337,123 +351,50 @@ func (c *Cache) GetHostname() string { return c.hostName }
 // PublicKey returns the public key of the server.
 func (c *Cache) PublicKey() signature.PublicKey { return c.secretKey.ToPublicKey() }
 
-// GetNar returns the nar given a hash and compression from the store. If the
-// nar is not found in the store, it's pulled from an upstream, stored in the
-// stored and finally returned.
-// NOTE: It's the caller responsibility to close the body.
+// GetNar serves a NAR from the cache. If it's not present, it checks if a
+// download job is in progress and waits for it. It does NOT initiate downloads.
 func (c *Cache) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadCloser, error) {
 	ctx, span := c.tracer.Start(
 		ctx,
 		"cache.GetNar",
 		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(
-			attribute.String("nar_url", narURL.String()),
-		),
+		trace.WithAttributes(attribute.String("nar_url", narURL.String())),
 	)
 	defer span.End()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	ctx = narURL.NewLogger(*zerolog.Ctx(ctx)).WithContext(ctx)
 
-	ctx = narURL.
-		NewLogger(*zerolog.Ctx(ctx)).
-		WithContext(ctx)
-
+	// Happy path: file is already in our store.
 	if c.narStore.HasNar(ctx, narURL) {
 		return c.getNarFromStore(ctx, &narURL)
 	}
 
-	// If the nar is not in store, attempt to stream it from upstream.
-	// The first request will initiate the stream and store it.
-	// Subsequent requests for the same NAR while it's being streamed/stored
-	// will wait for the first request to complete and then get it from the store.
+	// File is not in the store. Check if a download job is running for it.
 	c.muUpstreamJobs.Lock()
+	// NOTE: We check for a job by NAR hash, as this is what GetNar receives.
 	jobDoneC, jobInProgress := c.upstreamJobs[narURL.Hash]
-	if jobInProgress {
-		c.muUpstreamJobs.Unlock()
-		zerolog.Ctx(ctx).Info().Msg("NAR download already in progress, waiting for it to complete")
-		<-jobDoneC // Wait for the existing job to finish
-		zerolog.Ctx(ctx).Info().Msg("In-progress NAR download finished, now serving from store")
-		return c.getNarFromStore(ctx, &narURL)
-	}
-
-	// Create a new channel to signal completion of this job
-	newJobDoneC := make(chan struct{})
-	c.upstreamJobs[narURL.Hash] = newJobDoneC
 	c.muUpstreamJobs.Unlock()
 
-	// Ensure the job is removed from the map and the channel is closed when done
-	defer func() {
-		c.muUpstreamJobs.Lock()
-		delete(c.upstreamJobs, narURL.Hash)
-		c.muUpstreamJobs.Unlock()
-		close(newJobDoneC)
-	}()
-
-	zerolog.Ctx(ctx).Info().Msg("NAR not in store, attempting to stream from upstream")
-
-	// Get the NAR from upstream
-	// create a detachedCtx that has the same span and logger as the main
-	// context but with the baseContext as parent; This context will not cancel
-	// when ctx is canceled allowing us to continue pulling the nar in the
-	// background.
-	detachedCtx := trace.ContextWithSpan(
-		zerolog.Ctx(ctx).WithContext(c.baseContext),
-		trace.SpanFromContext(ctx),
-	)
-	upstreamResp, selectedUC, narInfoFromUpstream, err := c.initiateNarDownloadFromUpstream(detachedCtx, &narURL, nil, nil, false)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			zerolog.Ctx(ctx).Info().Msg("NAR not found in upstream")
-		} else {
-			zerolog.Ctx(ctx).Error().Err(err).Msg("failed to initiate NAR download from upstream")
+	if jobInProgress {
+		zerolog.Ctx(ctx).Info().Msg("NAR not in store, but download is in progress. Waiting...")
+		select {
+		case <-jobDoneC:
+			zerolog.Ctx(ctx).Info().Msg("In-progress NAR download finished. Now serving from store.")
+			// The job is done, the file should be in the store now.
+			return c.getNarFromStore(ctx, &narURL)
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
 		}
-		return 0, nil, err // Propagate storage.ErrNotFound or other errors
 	}
 
-	// Use TeeReader to stream to client and save to store simultaneously.
-	// pipeReader will be read by the client (returned by GetNar).
-	// pipeWriter is where TeeReader will write the data.
-	clientPipeReader, storePipeWriter := io.Pipe()
-
-	// teeReader reads from upstreamResp.Body. As it's read (by storeNarFromStream),
-	// the data is also written to storePipeWriter.
-	teeReader := io.TeeReader(upstreamResp.Body, storePipeWriter)
-
-	// Goroutine to store the NAR in the background by reading from teeReader.
-	// This drives the consumption of upstreamResp.Body and writing to storePipeWriter.
-	go func() {
-		// When this goroutine finishes (either by completing the read or error),
-		// close the upstream response body and the writer end of the pipe.
-		defer upstreamResp.Body.Close()
-		defer storePipeWriter.Close() // Important to signal EOF to clientPipeReader
-
-		// Determine if ZSTD compression was applied during download for narInfo update
-		// This needs to be based on the actual narURL used for download and narInfoFromUpstream
-		var wasZSTDEnabledForDownload bool
-		if narInfoFromUpstream != nil {
-			// If narInfo was for 'none' and we attempted zstd
-			wasZSTDEnabledForDownload = narInfoFromUpstream.Compression == nar.CompressionTypeNone.String() && narURL.Compression == nar.CompressionTypeZstd
-		} else {
-			// If no prior narInfo, check if original URL was non-ZSTD but current is ZSTD (though this path is less common without narInfo)
-			// This part of enableZSTD logic might need refinement based on how narURL is mutated.
-			// For now, let's assume narURL passed to storeNarFromStream has the final compression type.
-			wasZSTDEnabledForDownload = narURL.Compression == nar.CompressionTypeZstd
-		}
-
-
-		// Pass selectedUC and narInfoFromUpstream if available
-		// The storeNarFromStream function will read from teeReader to completion.
-		c.storeNarFromStream(detachedCtx, &narURL, io.NopCloser(teeReader), upstreamResp.ContentLength, selectedUC, narInfoFromUpstream, wasZSTDEnabledForDownload)
-	}()
-
-	// Return clientPipeReader for the client to read from, and the content length from the upstream response.
-	zerolog.Ctx(ctx).Info().Msg("Streaming NAR from upstream to client and storing in background")
-	return upstreamResp.ContentLength, io.NopCloser(clientPipeReader), nil
+	// Not in store and no job is running. This implies a client asked for a NAR
+	// for which a narinfo was never requested.
+	zerolog.Ctx(ctx).Warn().Msg("Requested NAR not in cache and no download job is in progress.")
+	return 0, nil, storage.ErrNotFound
 }
 
 // PutNar records the NAR (given as an io.Reader) into the store.
-func (c *Cache) PutNar(ctx context.Context, narURL nar.URL, r io.ReadCloser) error {
+func (c *Cache) PutNar(ctx context.Context, narURL nar.URL, r io.Reader) (int64, error) {
 	ctx, span := c.tracer.Start(
 		ctx,
 		"cache.PutNar",
@@ -471,16 +412,12 @@ func (c *Cache) PutNar(ctx context.Context, narURL nar.URL, r io.ReadCloser) err
 		NewLogger(*zerolog.Ctx(ctx)).
 		WithContext(ctx)
 
-	defer func() {
-		//nolint:errcheck
-		io.Copy(io.Discard, r)
+	// Since r is an io.Reader, not an io.ReadCloser, we don't need to close it.
+	// But if the caller passes an io.ReadCloser, it's their responsibility to close it.
+	// We'll just read from it.
+	written, err := c.narStore.PutNar(ctx, narURL, r)
 
-		r.Close()
-	}()
-
-	_, err := c.narStore.PutNar(ctx, narURL, r)
-
-	return err
+	return written, err
 }
 
 // DeleteNar deletes the nar from the store.
@@ -505,88 +442,6 @@ func (c *Cache) DeleteNar(ctx context.Context, narURL nar.URL) error {
 	return c.narStore.DeleteNar(ctx, narURL)
 }
 
-func (c *Cache) pullNar(
-	ctx context.Context,
-	narURL *nar.URL,
-	uc *upstream.Cache,
-	narInfo *narinfo.NarInfo,
-	enableZSTD bool,
-	doneC chan struct{},
-) {
-	done := func() {
-		c.muUpstreamJobs.Lock()
-		delete(c.upstreamJobs, narURL.Hash)
-		c.muUpstreamJobs.Unlock()
-
-		close(doneC)
-	}
-
-	ctx, span := c.tracer.Start(
-		ctx,
-		"cache.pullNar",
-		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(
-			attribute.String("nar_url", narURL.String()),
-		),
-	)
-	defer span.End()
-
-	now := time.Now()
-
-	zerolog.Ctx(ctx).
-		Info().
-		Msg("downloading the nar from upstream")
-
-	resp, err := c.getNarFromUpstream(ctx, narURL, uc, narInfo, enableZSTD)
-	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			zerolog.Ctx(ctx).
-				Error().
-				Err(err).
-				Msg("error getting the nar from upstream caches")
-		} else {
-			zerolog.Ctx(ctx).
-				Info().
-				Err(err).
-				Msg("error getting the nar from upstream caches")
-		}
-
-		done()
-
-		return
-	}
-
-	defer func() {
-		//nolint:errcheck
-		io.Copy(io.Discard, resp.Body)
-
-		resp.Body.Close()
-	}()
-
-	written, err := c.narStore.PutNar(ctx, *narURL, resp.Body)
-	if err != nil {
-		zerolog.Ctx(ctx).
-			Error().
-			Err(err).
-			Msg("error storing the narInfo in the store")
-
-		done()
-
-		return
-	}
-
-	if enableZSTD && written > 0 {
-		narInfo.FileSize = uint64(written)
-	}
-
-	zerolog.Ctx(ctx).
-		Info().
-		Dur("elapsed", time.Since(now)).
-		Msg("download of nar complete")
-
-	done()
-}
-
 func (c *Cache) getNarFromStore(
 	ctx context.Context,
 	narURL *nar.URL,
@@ -603,115 +458,53 @@ func (c *Cache) getNarFromStore(
 
 	size, r, err := c.narStore.GetNar(ctx, *narURL)
 	if err != nil {
-		return 0, nil, fmt.Errorf("error fetching the narinfo from the store: %w", err)
+		return 0, nil, fmt.Errorf("error fetching the nar from the store: %w", err)
 	}
 
 	tx, err := c.db.DB().Begin()
 	if err != nil {
+		r.Close()
 		return 0, nil, fmt.Errorf("error beginning a transaction: %w", err)
 	}
 
+	// Use a defer func to ensure rollback happens on any subsequent error.
+	committed := false
 	defer func() {
-		if err := tx.Rollback(); err != nil {
-			if !errors.Is(err, sql.ErrTxDone) {
-				zerolog.Ctx(ctx).
-					Error().
-					Err(err).
-					Msg("error rolling back the transaction")
-			}
+		if !committed {
+			tx.Rollback()
 		}
 	}()
 
 	nr, err := c.db.WithTx(tx).GetNarByHash(ctx, narURL.Hash)
 	if err != nil {
-		// TODO: If record not found, record it instead!
+		// If the NAR file exists but the DB record doesn't, this is a state of inconsistency.
+		// For now, we return the stream but log the error.
+		// A more robust solution might try to repair the DB entry here.
 		if errors.Is(err, sql.ErrNoRows) {
+			zerolog.Ctx(ctx).Warn().Msg("NAR file found in store, but no corresponding database record.")
+			// We can proceed without erroring, but the `last_accessed_at` won't be updated.
+			committed = true // Prevent rollback
+			tx.Commit()      // Commit the empty transaction.
 			return size, r, nil
 		}
-
+		r.Close()
 		return 0, nil, fmt.Errorf("error fetching the nar record: %w", err)
 	}
 
 	if lat, err := nr.LastAccessedAt.Value(); err == nil && time.Since(lat.(time.Time)) > c.recordAgeIgnoreTouch {
 		if _, err := c.db.WithTx(tx).TouchNar(ctx, narURL.Hash); err != nil {
+			r.Close()
 			return 0, nil, fmt.Errorf("error touching the nar record: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
+		r.Close()
 		return 0, nil, fmt.Errorf("error committing the transaction: %w", err)
 	}
+	committed = true
 
 	return size, r, nil
-}
-
-func (c *Cache) getNarFromUpstream(
-	ctx context.Context,
-	narURL *nar.URL,
-	uc *upstream.Cache,
-	narInfo *narinfo.NarInfo,
-	enableZSTD bool,
-) (*http.Response, error) {
-	ctx, span := c.tracer.Start(
-		ctx,
-		"cache.getNarFromUpstream",
-		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(
-			attribute.String("nar_url", narURL.String()),
-		),
-	)
-	defer span.End()
-
-	var mutators []func(*http.Request)
-
-	if enableZSTD {
-		mutators = append(mutators, zstdMutator(ctx, narURL.Compression))
-
-		narURL.Compression = nar.CompressionTypeZstd
-
-		narInfo.Compression = nar.CompressionTypeZstd.String()
-		narInfo.URL = narURL.String()
-	}
-
-	ctx = narURL.
-		NewLogger(*zerolog.Ctx(ctx)).
-		WithContext(ctx)
-
-	var ucs []upstream.Cache
-	if uc != nil {
-		ucs = []upstream.Cache{*uc}
-	} else {
-		ucs = c.upstreamCaches
-	}
-
-	uc, err := c.selectNarUpstream(ctx, narURL, ucs, mutators)
-	if err != nil {
-		zerolog.Ctx(ctx).
-			Error().
-			Err(err).
-			Msg("error selecting an upstream for the nar")
-
-		return nil, err
-	}
-
-	if uc == nil {
-		return nil, storage.ErrNotFound
-	}
-
-	resp, err := uc.GetNar(ctx, *narURL, mutators...)
-	if err != nil {
-		if !errors.Is(err, upstream.ErrNotFound) {
-			zerolog.Ctx(ctx).
-				Error().
-				Err(err).
-				Str("hostname", uc.GetHostname()).
-				Msg("error fetching the nar from upstream")
-		}
-
-		return nil, err
-	}
-
-	return resp, nil
 }
 
 func (c *Cache) deleteNarFromStore(ctx context.Context, narURL *nar.URL) error {
@@ -774,29 +567,25 @@ func (c *Cache) GetNarInfo(ctx context.Context, hash string) (*narinfo.NarInfo, 
 		Msg("pulling nar in a go-routing and will wait for it")
 	<-doneC
 
+	// After the pull job is done, try to get it from the store again.
+	// This ensures we return the final, locally stored version.
 	return c.narInfoStore.GetNarInfo(ctx, hash)
 }
 
+// pullNarInfo is the background job to fetch narinfo and its corresponding NAR.
 func (c *Cache) pullNarInfo(
 	ctx context.Context,
 	hash string,
 	doneC chan struct{},
 ) {
-	done := func() {
-		c.muUpstreamJobs.Lock()
-		delete(c.upstreamJobs, hash)
-		c.muUpstreamJobs.Unlock()
-
-		close(doneC)
-	}
+	// This defer is critical. It signals completion to all waiters.
+	defer close(doneC)
 
 	ctx, span := c.tracer.Start(
 		ctx,
 		"cache.pullNarInfo",
 		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(
-			attribute.String("narinfo_hash", hash),
-		),
+		trace.WithAttributes(attribute.String("narinfo_hash", hash)),
 	)
 	defer span.End()
 
@@ -804,108 +593,65 @@ func (c *Cache) pullNarInfo(
 
 	uc, narInfo, err := c.getNarInfoFromUpstream(ctx, hash)
 	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			zerolog.Ctx(ctx).
-				Error().
-				Err(err).
-				Msg("error getting the narInfo from upstream caches")
-		} else {
-			zerolog.Ctx(ctx).
-				Info().
-				Err(err).
-				Msg("error getting the narInfo from upstream caches")
-		}
-
-		done()
-
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error getting narInfo from upstream")
 		return
 	}
 
 	narURL, err := nar.ParseURL(narInfo.URL)
 	if err != nil {
-		zerolog.Ctx(ctx).
-			Error().
-			Err(err).
-			Str("nar_url", narInfo.URL).
-			Msg("error parsing the nar URL")
-
-		done()
-
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error parsing nar URL from narinfo")
 		return
 	}
 
-	var enableZSTD bool
-
-	if narInfo.Compression == nar.CompressionTypeNone.String() {
-		enableZSTD = true
+	// This NAR download job needs its own lock and channel to handle concurrent `GetNar` requests.
+	c.muUpstreamJobs.Lock()
+	narDoneC, narJobInProgress := c.upstreamJobs[narURL.Hash]
+	if !narJobInProgress {
+		narDoneC = make(chan struct{})
+		c.upstreamJobs[narURL.Hash] = narDoneC
 	}
+	c.muUpstreamJobs.Unlock()
 
-	ctx = zerolog.Ctx(ctx).
-		With().
-		Str("nar_url", narInfo.URL).
-		Bool("zstd_support", enableZSTD).
-		Logger().
-		WithContext(ctx)
-
-	// Start a job to also pull the nar but don't wait for it to come back unless
-	// we need to alter the filesize/compression. For instance, Harmonia,
-	// explicitly returns none for compression but does accept encoding request,
-	// if that's the case we should get the compressed version and store that
-	// instead.
-	if enableZSTD {
-		<-c.prePullNar(ctx, &narURL, uc, narInfo, enableZSTD)
+	// If another job is already downloading this NAR, we don't need to do it again.
+	// But we must still wait for it to finish before we store our narinfo,
+	// in case the file size changes (e.g., ZSTD compression).
+	if narJobInProgress {
+		zerolog.Ctx(ctx).Info().Str("nar_hash", narURL.Hash).Msg("NAR download already in progress, waiting.")
+		<-narDoneC
 	} else {
-		// create a detachedCtx that has the same span and logger as the main
-		// context but with the baseContext as parent; This context will not cancel
-		// when ctx is canceled allowing us to continue pulling the nar in the
-		// background.
-		var detachedCtx context.Context
-		detachedCtx = trace.ContextWithSpan(
-			zerolog.Ctx(ctx).WithContext(c.baseContext),
-			trace.SpanFromContext(ctx),
-		)
-		c.prePullNar(detachedCtx, &narURL, uc, narInfo, enableZSTD)
+		// We are the leader for this NAR download.
+		defer func() {
+			c.muUpstreamJobs.Lock()
+			delete(c.upstreamJobs, narURL.Hash)
+			c.muUpstreamJobs.Unlock()
+			close(narDoneC)
+		}()
+
+		enableZSTD := narInfo.Compression == nar.CompressionTypeNone.String()
+		detachedCtx := trace.ContextWithSpan(zerolog.Ctx(ctx).WithContext(c.baseContext), trace.SpanFromContext(ctx))
+
+		resp, _, updatedNarInfo, err := c.initiateNarDownloadFromUpstream(detachedCtx, &narURL, uc, narInfo, enableZSTD)
+		if err != nil {
+			zerolog.Ctx(ctx).Error().Err(err).Msg("failed to download associated NAR")
+		} else {
+			c.storeNarFromStream(detachedCtx, &narURL, resp.Body, updatedNarInfo)
+		}
 	}
 
 	if err := c.signNarInfo(ctx, hash, narInfo); err != nil {
-		zerolog.Ctx(ctx).
-			Error().
-			Err(err).
-			Msg("error signing the narinfo")
-
-		done()
-
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error signing narinfo")
 		return
 	}
-
 	if err := c.narInfoStore.PutNarInfo(ctx, hash, narInfo); err != nil {
-		zerolog.Ctx(ctx).
-			Error().
-			Err(err).
-			Msg("error storing the narInfo in the store")
-
-		done()
-
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error storing narinfo")
 		return
 	}
-
 	if err := c.storeInDatabase(ctx, hash, narInfo); err != nil {
-		zerolog.Ctx(ctx).
-			Error().
-			Err(err).
-			Msg("error storing the narinfo in the database")
-
-		done()
-
+		zerolog.Ctx(ctx).Error().Err(err).Msg("error storing narinfo in database")
 		return
 	}
 
-	zerolog.Ctx(ctx).
-		Info().
-		Dur("elapsed", time.Since(now)).
-		Msg("download of narinfo complete")
-
-	done()
+	zerolog.Ctx(ctx).Info().Dur("elapsed", time.Since(now)).Msg("download and processing of narinfo complete")
 }
 
 // PutNarInfo records the narInfo (given as an io.Reader) into the store and signs it.
@@ -999,113 +745,6 @@ func (c *Cache) prePullNarInfo(ctx context.Context, hash string) chan struct{} {
 		c.upstreamJobs[hash] = doneC
 
 		go c.pullNarInfo(ctx, hash, doneC)
-	}
-	c.muUpstreamJobs.Unlock()
-
-	return doneC
-}
-
-func (c *Cache) prePullNar(
-	ctx context.Context,
-	narURL *nar.URL,
-	uc *upstream.Cache,
-	narInfo *narinfo.NarInfo,
-	enableZSTD bool,
-) chan struct{} {
-	ctx, span := c.tracer.Start(
-		ctx,
-		"cache.prePullNar",
-		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(
-			attribute.String("nar_url", narURL.String()),
-		),
-	)
-	defer span.End()
-
-	c.muUpstreamJobs.Lock()
-
-	doneC, jobInProgress := c.upstreamJobs[narURL.Hash]
-	if !jobInProgress {
-		doneC = make(chan struct{})
-		c.upstreamJobs[narURL.Hash] = doneC
-		// Launch pullNar in a goroutine. pullNar itself will handle unregistering the job
-		// by closing doneC and removing from upstreamJobs map is NOT done by pullNar directly.
-		// prePullNar's caller (e.g. GetNar or pullNarInfo) is responsible for the job lifecycle
-		// in upstreamJobs map.
-		// pullNar is responsible for closing the doneC channel it's given.
-		go func() {
-			// This goroutine is responsible for eventually closing doneC via pullNar's defer.
-			// It also needs to remove the job from the map once pullNar is fully complete.
-			// This was previously missing and could lead to stale entries if pullNar errored early.
-			// However, GetNar now has its own defer to clean up its jobs.
-			// pullNar, when called from pullNarInfo, needs a similar cleanup wrapper if prePullNar
-			// is responsible for adding to upstreamJobs.
-			defer func() {
-				c.muUpstreamJobs.Lock()
-				// Only delete if this instance of prePullNar was the one that created it.
-				// This check is imperfect if another request for the same hash comes in fractionally later
-				// and gets the same doneC.
-				// A robust way is for pullNar to signal actual completion (not just starting store).
-				// For now, pullNar closes doneC. The job map cleanup for prePullNar-initiated jobs
-				// needs to be handled carefully.
-				// The GetNar path handles its own job removal.
-				// For pullNarInfo->prePullNar->pullNar:
-				// pullNarInfo waits on doneC. Once doneC is closed, pullNarInfo proceeds.
-				// The job entry in upstreamJobs should be removed then.
-				// The current structure of pullNar closing doneC works for signaling.
-				// The map cleanup for jobs started by prePullNar (for pullNarInfo) is the main concern here.
-
-				// Let's simplify: pullNar is given doneC and is responsible for closing it.
-				// The management of upstreamJobs (add/delete) should be symmetric.
-				// If prePullNar adds it, it (or its context) should remove it.
-
-				// Current pullNar closes doneC.
-				// GetNar adds/removes its own entries from upstreamJobs.
-				// prePullNar (for pullNarInfo) adds to upstreamJobs. The corresponding remove is missing.
-				// Let's add the remove here, after pullNar finishes (indicated by doneC closing).
-				// This means we need to wait for doneC here IF this goroutine created the job.
-				// This is getting complicated.
-				// Simpler: The entity that adds to upstreamJobs is responsible for removing.
-				// GetNar does this.
-				// For prePullNar (used by pullNarInfo):
-				// pullNarInfo calls prePullNar, which adds the job and starts pullNar.
-				// pullNarInfo waits on the returned doneC.
-				// After doneC is closed (pullNar finished/errored), pullNarInfo should remove the job.
-				// This is not how it's currently structured. prePullNarInfo doesn't get access to muUpstreamJobs.
-
-				// Let's stick to the original logic for prePullNar for now: it adds the job,
-				// pullNar closes doneC. The job removal for these types of jobs was implicit
-				// via GetNar if it was the one checking, or never happened if only pullNarInfo
-				// triggered it.
-				// The defer in pullNar now closes doneC.
-				// The map c.upstreamJobs[narURL.Hash] = doneC is the key.
-				// The responsibility of removing narURL.Hash from c.upstreamJobs needs to be clear.
-				// Option 1: pullNar removes it before closing doneC. (done in pullNar's main path, not defer)
-				// Option 2: The caller of prePullNar removes it after <-doneC. (requires exposing map or a new func)
-				// Option 3: The goroutine started by prePullNar removes it after pullNar returns.
-
-				// The `defer close(doneC)` is IN `pullNar`.
-				// The `defer delete` is IN `GetNar`.
-				// For `prePullNar` usage (by `pullNarInfo`), the `delete` is missing.
-				// Let's add it to the goroutine launched by `prePullNar`.
-				c.pullNar(ctx, narURL, uc, narInfo, enableZSTD, doneC) // pullNar will close doneC
-
-				// After pullNar completes (i.e., doneC is closed), remove the job from the map.
-				// This ensures that if prePullNar initiated the job, it's also responsible for cleaning it up from the map.
-				c.muUpstreamJobs.Lock()
-				// Check if the job is still ours before deleting, though not perfectly race-proof.
-				// If another GetNar came for the same hash and found this job, it would wait.
-				// If this pullNar finishes, GetNar would then try to get from store.
-				// If this pullNar failed and another GetNar came, it might start a new job.
-				currentJob, stillExists := c.upstreamJobs[narURL.Hash]
-				if stillExists && currentJob == doneC { // only remove if it's the same channel instance
-					delete(c.upstreamJobs, narURL.Hash)
-				}
-				c.muUpstreamJobs.Unlock()
-			}()
-		}()
-	} else {
-		zerolog.Ctx(ctx).Info().Msg("NAR download job already in progress, joining wait")
 	}
 	c.muUpstreamJobs.Unlock()
 
@@ -1762,16 +1401,15 @@ func (c *Cache) selectNarUpstream(
 	})
 }
 
+// selectUpstream has a subtle bug fix for capturing the loop variable.
 func (c *Cache) selectUpstream(
 	ctx context.Context,
 	ucs []upstream.Cache,
 	selectFn upstreamSelectionFn,
 ) (*upstream.Cache, error) {
 	if len(ucs) == 0 {
-		//nolint:nilnil
 		return nil, nil
 	}
-
 	if len(ucs) == 1 {
 		return &ucs[0], nil
 	}
@@ -1780,32 +1418,35 @@ func (c *Cache) selectUpstream(
 	errC := make(chan error)
 
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	var wg sync.WaitGroup
-	for _, uc := range ucs {
+	for i := range ucs {
+		uc := ucs[i] // Capture loop variable to prevent race in goroutine.
 		wg.Add(1)
-
 		go selectFn(ctx, &uc, &wg, ch, errC)
 	}
 
 	go func() {
 		wg.Wait()
-
 		close(ch)
+		close(errC)
 	}()
 
 	var errs error
-
-	for {
+	for i := 0; i < len(ucs); i++ { // Bound the loop to prevent infinite wait.
 		select {
-		case uc := <-ch:
-			cancel()
-
-			return uc, errs
-		case err := <-errC:
-			if !errors.Is(err, context.Canceled) {
+		case uc, ok := <-ch:
+			if ok {
+				return uc, errs
+			}
+			ch = nil // Prevent selecting from a closed channel.
+		case err, ok := <-errC:
+			if ok && !errors.Is(err, context.Canceled) {
 				errs = errors.Join(errs, err)
 			}
 		}
 	}
+
+	return nil, errs
 }

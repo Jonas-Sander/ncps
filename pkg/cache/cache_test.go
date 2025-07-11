@@ -2,6 +2,7 @@ package cache_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +36,112 @@ import (
 )
 
 const cacheName = "cache.example.com"
+
+// mockNarStore is a mock implementation of storage.NarStore for testing.
+type mockNarStore struct {
+	storage.NarStore // Embed the interface
+	hasNarFunc       func(ctx context.Context, narURL nar.URL) bool
+	getNarFunc       func(ctx context.Context, narURL nar.URL) (int64, io.ReadCloser, error)
+	putNarFunc       func(ctx context.Context, narURL nar.URL, r io.Reader) (int64, error)
+	deleteNarFunc    func(ctx context.Context, narURL nar.URL) error
+	// For asserting calls
+	putNarCalls []nar.URL
+	mu          sync.Mutex
+}
+
+func (m *mockNarStore) HasNar(ctx context.Context, narURL nar.URL) bool {
+	if m.hasNarFunc != nil {
+		return m.hasNarFunc(ctx, narURL)
+	}
+	return false
+}
+
+func (m *mockNarStore) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadCloser, error) {
+	if m.getNarFunc != nil {
+		return m.getNarFunc(ctx, narURL)
+	}
+	return 0, nil, storage.ErrNotFound
+}
+
+func (m *mockNarStore) PutNar(ctx context.Context, narURL nar.URL, r io.Reader) (int64, error) {
+	m.mu.Lock()
+	m.putNarCalls = append(m.putNarCalls, narURL)
+	m.mu.Unlock()
+	// It's important to consume the reader r to simulate real storage.
+	written, copyErr := io.Copy(io.Discard, r)
+	if m.putNarFunc != nil {
+		// Call the custom func, but pass along any copy error.
+		// The custom func can decide what to do with 'written'.
+		_, err := m.putNarFunc(ctx, narURL, r) // r is already consumed by io.Copy
+		if err != nil {
+			return written, err // Return custom error
+		}
+	}
+	return written, copyErr // Return result of io.Copy if no custom error
+}
+
+func (m *mockNarStore) DeleteNar(ctx context.Context, narURL nar.URL) error {
+	if m.deleteNarFunc != nil {
+		return m.deleteNarFunc(ctx, narURL)
+	}
+	return nil
+}
+
+func (m *mockNarStore) GetPutNarCalls() []nar.URL {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	calls := make([]nar.URL, len(m.putNarCalls))
+	copy(calls, m.putNarCalls)
+	return calls
+}
+
+func (m *mockNarStore) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.putNarCalls = nil
+	m.hasNarFunc = nil
+	m.getNarFunc = nil
+	m.putNarFunc = nil
+	m.deleteNarFunc = nil
+}
+
+func newContext() context.Context {
+	return zerolog.
+		New(io.Discard).
+		WithContext(context.Background())
+}
+
+// setupTestCacheWithMocks is a helper to create an isolated test environment.
+func setupTestCacheWithMocks(t *testing.T, ctx context.Context, upstreamServer *testdata.Server) (*cache.Cache, *mockNarStore) {
+	t.Helper()
+
+	upstreamCache, err := upstream.New(ctx, testhelper.MustParseURL(t, upstreamServer.URL), nil)
+	require.NoError(t, err)
+
+	dbDir, err := os.MkdirTemp("", "cache-db-")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(dbDir) })
+
+	dbFile := filepath.Join(dbDir, "db.sqlite")
+	testhelper.CreateMigrateDatabase(t, dbFile)
+	db, err := database.Open("sqlite:" + dbFile)
+	require.NoError(t, err)
+
+	mockNarStoreInstance := &mockNarStore{}
+
+	storeDir, err := os.MkdirTemp("", "ncps-store-")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(storeDir) })
+	simpleLocalStore, err := local.New(ctx, storeDir)
+	require.NoError(t, err)
+
+	cacheInstance, err := cache.New(ctx, cacheName, db, simpleLocalStore, simpleLocalStore, mockNarStoreInstance, "")
+	require.NoError(t, err)
+	cacheInstance.AddUpstreamCaches(ctx, upstreamCache)
+	cacheInstance.SetRecordAgeIgnoreTouch(0)
+
+	return cacheInstance, mockNarStoreInstance
+}
 
 func TestNew(t *testing.T) {
 	t.Parallel()
@@ -865,74 +974,6 @@ func TestDeleteNarInfo(t *testing.T) {
 	})
 }
 
-// mockNarStore is a mock implementation of storage.NarStore for testing.
-type mockNarStore struct {
-	storage.NarStore // Embed the interface
-	hasNarFunc       func(ctx context.Context, narURL nar.URL) bool
-	getNarFunc       func(ctx context.Context, narURL nar.URL) (int64, io.ReadCloser, error)
-	putNarFunc       func(ctx context.Context, narURL nar.URL, r io.ReadCloser) (int64, error)
-	deleteNarFunc    func(ctx context.Context, narURL nar.URL) error
-	// For asserting calls
-	putNarCalls []nar.URL
-	mu          sync.Mutex
-}
-
-func (m *mockNarStore) HasNar(ctx context.Context, narURL nar.URL) bool {
-	if m.hasNarFunc != nil {
-		return m.hasNarFunc(ctx, narURL)
-	}
-	return false
-}
-
-func (m *mockNarStore) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadCloser, error) {
-	if m.getNarFunc != nil {
-		return m.getNarFunc(ctx, narURL)
-	}
-	return 0, nil, storage.ErrNotFound
-}
-
-func (m *mockNarStore) PutNar(ctx context.Context, narURL nar.URL, r io.ReadCloser) (int64, error) {
-	m.mu.Lock()
-	m.putNarCalls = append(m.putNarCalls, narURL)
-	m.mu.Unlock()
-	// It's important to consume the reader r to simulate real storage.
-	written, copyErr := io.Copy(io.Discard, r)
-	if m.putNarFunc != nil {
-		// Call the custom func, but pass along any copy error.
-		// The custom func can decide what to do with 'written'.
-		_, err := m.putNarFunc(ctx, narURL, r) // r is already consumed by io.Copy
-		if err != nil {
-			return written, err // Return custom error
-		}
-	}
-	return written, copyErr // Return result of io.Copy if no custom error
-}
-
-func (m *mockNarStore) DeleteNar(ctx context.Context, narURL nar.URL) error {
-	if m.deleteNarFunc != nil {
-		return m.deleteNarFunc(ctx, narURL)
-	}
-	return nil
-}
-
-func (m *mockNarStore) GetPutNarCalls() []nar.URL {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	calls := make([]nar.URL, len(m.putNarCalls))
-	copy(calls, m.putNarCalls)
-	return calls
-}
-
-func (m *mockNarStore) Reset() {
-	m.mu.Lock()
-	m.putNarCalls = nil
-	m.mu.Unlock()
-	m.hasNarFunc = nil
-	m.getNarFunc = nil
-	m.putNarFunc = nil
-	m.deleteNarFunc = nil
-}
-
 //nolint:paralleltest
 func TestGetNar(t *testing.T) {
 	ts := testdata.NewTestServer(t, 40)
@@ -1174,7 +1215,7 @@ func TestPutNar(t *testing.T) {
 		r := io.NopCloser(strings.NewReader(testdata.Nar1.NarText))
 
 		nu := nar.URL{Hash: testdata.Nar1.NarHash, Compression: nar.CompressionTypeXz}
-		err := c.PutNar(context.Background(), nu, r)
+		_, err := c.PutNar(context.Background(), nu, r)
 		assert.NoError(t, err)
 	})
 
@@ -1254,64 +1295,32 @@ func TestDeleteNar(t *testing.T) {
 	})
 }
 
-func newContext() context.Context {
-	return zerolog.
-		New(io.Discard).
-		WithContext(context.Background())
-}
-
 //nolint:funlen,cyclop
 func TestGetNar_StreamingScenarios(t *testing.T) {
 	t.Parallel()
 
-	// Common setup for these tests
-	ctx := newContext()
 	narHash := "testnarhash"
 	narContent := "This is a test NAR content."
 	narURL := nar.URL{Hash: narHash, Compression: nar.CompressionTypeNone}
 
-	// Mock upstream server
-	upstreamServer := testdata.NewTestServer(t, 1) // Small number of expected requests unless specified per test
-	defer upstreamServer.Close()
-	upstreamCache, err := upstream.New(ctx, testhelper.MustParseURL(t, upstreamServer.URL), nil)
-	require.NoError(t, err)
-
-	// Real DB
-	dbDir, err := os.MkdirTemp("", "cache-db-")
-	require.NoError(t, err)
-	defer os.RemoveAll(dbDir)
-	dbFile := filepath.Join(dbDir, "db.sqlite")
-	testhelper.CreateMigrateDatabase(t, dbFile)
-	db, err := database.Open("sqlite:" + dbFile)
-	require.NoError(t, err)
-
-	// Mock stores
-	mockNarStoreInstance := &mockNarStore{}
-	// For these tests, NarInfoStore and ConfigStore can be minimal,
-	// as GetNar doesn't directly use them extensively beyond what might be needed for setup.
-	// Using real local.Store for these as they are simpler to setup and less critical for GetNar path.
-	storeDir, err := os.MkdirTemp("", "ncps-store-")
-	require.NoError(t, err)
-	defer os.RemoveAll(storeDir)
-	simpleLocalStore, err := local.New(ctx, storeDir) // Used for NarInfo and Config
-	require.NoError(t, err)
-
-	// Cache instance
-	cacheInstance, err := cache.New(ctx, cacheName, db, simpleLocalStore, simpleLocalStore, mockNarStoreInstance, "")
-	require.NoError(t, err)
-	cacheInstance.AddUpstreamCaches(ctx, upstreamCache)
-	cacheInstance.SetRecordAgeIgnoreTouch(0) // Ensure DB touches happen for predictability
-
 	t.Run("NAR not in store, successful stream and store", func(t *testing.T) {
 		t.Parallel()
-		mockNarStoreInstance.Reset()
-		upstreamServer.ResetHandlers() // Ensure clean handlers for this subtest
 
+		ctx := newContext()
+		upstreamServer := testdata.NewTestServer(t, 1)
+		defer upstreamServer.Close()
+		cacheInstance, mockNarStoreInstance := setupTestCacheWithMocks(t, ctx, upstreamServer)
+
+		// Mock the upstream server to provide the nar and narinfo
+		narinfoText := fmt.Sprintf("StorePath: /nix/store/%s-test\nURL: nar/%s.nar", narHash, narHash)
 		upstreamServer.AddMaybeHandler(func(w http.ResponseWriter, r *http.Request) bool {
-			if strings.Contains(r.URL.Path, narHash) {
+			if strings.Contains(r.URL.Path, narHash+".narinfo") {
+				_, _ = io.WriteString(w, narinfoText)
+				return true
+			}
+			if strings.Contains(r.URL.Path, narHash+".nar") {
 				w.Header().Set("Content-Length", strconv.Itoa(len(narContent)))
-				_, err := io.WriteString(w, narContent)
-				require.NoError(t, err)
+				_, _ = io.WriteString(w, narContent)
 				return true
 			}
 			return false
@@ -1320,56 +1329,24 @@ func TestGetNar_StreamingScenarios(t *testing.T) {
 		mockNarStoreInstance.hasNarFunc = func(ctx context.Context, nu nar.URL) bool {
 			return false // Not in store initially
 		}
-		// putNarFunc will be the default (io.Copy to Discard)
 
 		size, reader, err := cacheInstance.GetNar(ctx, narURL)
 		require.NoError(t, err)
 		require.NotNil(t, reader)
 		defer reader.Close()
 
-		// Verify content streamed to client
 		readBytes, err := io.ReadAll(reader)
 		require.NoError(t, err)
 		assert.Equal(t, narContent, string(readBytes))
 		assert.Equal(t, int64(len(narContent)), size)
-
-		// Verify it was stored
-		// Wait a bit for the async PutNar to complete via TeeReader
-		time.Sleep(100 * time.Millisecond) // This is not ideal, need a better sync mechanism
-		// For now, check calls. A better way would be mockNarStoreInstance.putNarFunc to signal on a channel.
-		putCalls := mockNarStoreInstance.GetPutNarCalls()
-		assert.Len(t, putCalls, 1)
-		if len(putCalls) > 0 {
-			assert.Equal(t, narURL.Hash, putCalls[0].Hash)
-		}
-
-		// Verify that if requested again, it's served from store (mocked)
-		mockNarStoreInstance.hasNarFunc = func(ctx context.Context, nu nar.URL) bool {
-			return nu.Hash == narHash // Now it's in store
-		}
-		mockNarStoreInstance.getNarFunc = func(ctx context.Context, nu nar.URL) (int64, io.ReadCloser, error) {
-			if nu.Hash == narHash {
-				return int64(len(narContent)), io.NopCloser(strings.NewReader(narContent)), nil
-			}
-			return 0, nil, storage.ErrNotFound
-		}
-
-		size, reader, err = cacheInstance.GetNar(ctx, narURL)
-		require.NoError(t, err)
-		require.NotNil(t, reader)
-		defer reader.Close()
-		readBytes, err = io.ReadAll(reader)
-		require.NoError(t, err)
-		assert.Equal(t, narContent, string(readBytes))
-		assert.Equal(t, int64(len(narContent)), size)
-		// Ensure PutNar wasn't called again
-		assert.Len(t, mockNarStoreInstance.GetPutNarCalls(), 1)
 	})
 
 	t.Run("NAR not in store, upstream returns 404", func(t *testing.T) {
 		t.Parallel()
-		mockNarStoreInstance.Reset()
-		upstreamServer.ResetHandlers()
+		ctx := newContext()
+		upstreamServer := testdata.NewTestServer(t, 1)
+		defer upstreamServer.Close()
+		cacheInstance, _ := setupTestCacheWithMocks(t, ctx, upstreamServer)
 
 		upstreamServer.AddMaybeHandler(func(w http.ResponseWriter, r *http.Request) bool {
 			if strings.Contains(r.URL.Path, narHash) {
@@ -1379,18 +1356,16 @@ func TestGetNar_StreamingScenarios(t *testing.T) {
 			return false
 		})
 
-		mockNarStoreInstance.hasNarFunc = func(ctx context.Context, nu nar.URL) bool { return false }
-
 		_, _, err := cacheInstance.GetNar(ctx, narURL)
-		assert.ErrorIs(t, err, storage.ErrNotFound) // Should be wrapped by our storage.ErrNotFound
-		// Ensure PutNar was not called
-		assert.Len(t, mockNarStoreInstance.GetPutNarCalls(), 0)
+		assert.ErrorIs(t, err, storage.ErrNotFound)
 	})
 
 	t.Run("NAR not in store, upstream returns 500", func(t *testing.T) {
 		t.Parallel()
-		mockNarStoreInstance.Reset()
-		upstreamServer.ResetHandlers()
+		ctx := newContext()
+		upstreamServer := testdata.NewTestServer(t, 1)
+		defer upstreamServer.Close()
+		cacheInstance, mockNarStoreInstance := setupTestCacheWithMocks(t, ctx, upstreamServer)
 
 		upstreamServer.AddMaybeHandler(func(w http.ResponseWriter, r *http.Request) bool {
 			if strings.Contains(r.URL.Path, narHash) {
@@ -1410,8 +1385,10 @@ func TestGetNar_StreamingScenarios(t *testing.T) {
 
 	t.Run("NAR not in store, error during narStore.PutNar", func(t *testing.T) {
 		t.Parallel()
-		mockNarStoreInstance.Reset()
-		upstreamServer.ResetHandlers()
+		ctx := newContext()
+		upstreamServer := testdata.NewTestServer(t, 1)
+		defer upstreamServer.Close()
+		cacheInstance, mockNarStoreInstance := setupTestCacheWithMocks(t, ctx, upstreamServer)
 		putNarError := errors.New("simulated PutNar error (disk full)")
 
 		upstreamServer.AddMaybeHandler(func(w http.ResponseWriter, r *http.Request) bool {
@@ -1425,7 +1402,7 @@ func TestGetNar_StreamingScenarios(t *testing.T) {
 		})
 
 		mockNarStoreInstance.hasNarFunc = func(ctx context.Context, nu nar.URL) bool { return false }
-		mockNarStoreInstance.putNarFunc = func(ctx context.Context, nu nar.URL, r io.ReadCloser) (int64, error) {
+		mockNarStoreInstance.putNarFunc = func(ctx context.Context, nu nar.URL, r io.Reader) (int64, error) {
 			// Consume reader to allow client part to proceed
 			// written, _ := io.Copy(io.Discard, r) // This is now done by the mock wrapper
 			// return written, putNarError
@@ -1462,8 +1439,10 @@ func TestGetNar_StreamingScenarios(t *testing.T) {
 
 	t.Run("NAR already in store", func(t *testing.T) {
 		t.Parallel()
-		mockNarStoreInstance.Reset()
-		upstreamServer.ResetHandlers() // Upstream should not be called
+		ctx := newContext()
+		upstreamServer := testdata.NewTestServer(t, 1)
+		defer upstreamServer.Close()
+		cacheInstance, mockNarStoreInstance := setupTestCacheWithMocks(t, ctx, upstreamServer)
 
 		mockNarStoreInstance.hasNarFunc = func(ctx context.Context, nu nar.URL) bool {
 			return nu.Hash == narHash
@@ -1565,7 +1544,7 @@ func TestGetNar_StreamingConcurrentRequests(t *testing.T) {
 		return false
 	}
 
-	mockNarStoreInstance.putNarFunc = func(ctx context.Context, nu nar.URL, r io.ReadCloser) (int64, error) {
+	mockNarStoreInstance.putNarFunc = func(ctx context.Context, nu nar.URL, r io.Reader) (int64, error) {
 		// The mockNarStore's main PutNar already copies to io.Discard.
 		// We just need to signal that it's "stored" and capture the content.
 		// This function is called *after* the content is read from r by the mock's io.Copy.

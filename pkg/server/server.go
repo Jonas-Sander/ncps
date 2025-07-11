@@ -493,7 +493,7 @@ func (s *Server) putNar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.cache.PutNar(r.Context(), nu, r.Body); err != nil {
+	if _, err := s.cache.PutNar(r.Context(), nu, r.Body); err != nil {
 		zerolog.Ctx(r.Context()).
 			Error().
 			Err(err).

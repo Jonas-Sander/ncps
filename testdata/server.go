@@ -62,6 +62,13 @@ func (s *Server) RemoveMaybeHandler(idx string) {
 	delete(s.maybeHandlers, idx)
 }
 
+func (s *Server) ResetHandlers() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.maybeHandlers = make(map[string]MaybeHandlerFunc)
+}
+
 func compressMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept-Encoding") != "zstd" {
