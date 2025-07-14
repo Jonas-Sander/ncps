@@ -33,26 +33,34 @@ func TestNew(t *testing.T) {
 
 	t.Run("path is required", func(t *testing.T) {
 		t.Parallel()
+
 		_, err := local.New(newContext(), "")
+
 		assert.ErrorIs(t, err, local.ErrPathMustBeAbsolute)
 	})
 
 	t.Run("path is not absolute", func(t *testing.T) {
 		t.Parallel()
+
 		_, err := local.New(newContext(), "somedir")
 		assert.ErrorIs(t, err, local.ErrPathMustBeAbsolute)
 	})
 
 	t.Run("path must exist", func(t *testing.T) {
 		t.Parallel()
+
 		_, err := local.New(newContext(), "/non-existing")
+
 		assert.ErrorIs(t, err, local.ErrPathMustExist)
 	})
 
 	t.Run("path must be a directory", func(t *testing.T) {
 		t.Parallel()
+
 		f, err := os.CreateTemp("", "somefile")
+
 		require.NoError(t, err)
+
 		defer os.Remove(f.Name())
 
 		_, err = local.New(newContext(), f.Name())
@@ -61,8 +69,11 @@ func TestNew(t *testing.T) {
 
 	t.Run("path must be writable", func(t *testing.T) {
 		t.Parallel()
+
 		dir, err := os.MkdirTemp("", "cache-path-")
+
 		require.NoError(t, err)
+
 		defer os.RemoveAll(dir) // clean up
 
 		require.NoError(t, os.Chmod(dir, 0o500))
@@ -73,14 +84,19 @@ func TestNew(t *testing.T) {
 
 	t.Run("valid path must return no error", func(t *testing.T) {
 		t.Parallel()
+
 		_, err := local.New(newContext(), os.TempDir())
+
 		assert.NoError(t, err)
 	})
 
 	t.Run("should create directories", func(t *testing.T) {
 		t.Parallel()
+
 		dir, err := os.MkdirTemp("", "cache-path-")
+
 		require.NoError(t, err)
+
 		defer os.RemoveAll(dir)
 
 		_, err = local.New(newContext(), dir)
@@ -104,8 +120,11 @@ func TestNew(t *testing.T) {
 
 	t.Run("store/tmp is removed on boot", func(t *testing.T) {
 		t.Parallel()
+
 		dir, err := os.MkdirTemp("", "cache-path-")
+
 		require.NoError(t, err)
+
 		defer os.RemoveAll(dir)
 
 		// create the directory tmp and add a file inside of it
