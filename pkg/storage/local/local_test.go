@@ -81,7 +81,7 @@ func TestNew(t *testing.T) {
 		t.Parallel()
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		_, err = local.New(newContext(), dir)
 		require.NoError(t, err)
@@ -95,9 +95,8 @@ func TestNew(t *testing.T) {
 		}
 
 		for _, p := range dirs {
+			//nolint:paralleltest
 			t.Run("Checking that "+p+" exists", func(t *testing.T) {
-				t.Parallel()
-				// THE FIX: Use assert.DirExists for checking directories.
 				assert.DirExists(t, filepath.Join(dir, p))
 			})
 		}
@@ -107,7 +106,7 @@ func TestNew(t *testing.T) {
 		t.Parallel()
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		// create the directory tmp and add a file inside of it
 		err = os.MkdirAll(filepath.Join(dir, "store", "tmp"), 0o700)
@@ -131,7 +130,7 @@ func TestGetSecretKey(t *testing.T) {
 
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		s, err := local.New(newContext(), dir)
 		require.NoError(t, err)
@@ -145,7 +144,7 @@ func TestGetSecretKey(t *testing.T) {
 
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		ctx := newContext()
 
@@ -176,7 +175,7 @@ func TestPutSecretKey(t *testing.T) {
 
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		ctx := newContext()
 
@@ -205,7 +204,7 @@ func TestPutSecretKey(t *testing.T) {
 
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		ctx := newContext()
 
@@ -237,7 +236,7 @@ func TestDeleteSecretKey(t *testing.T) {
 
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		s, err := local.New(newContext(), dir)
 		require.NoError(t, err)
@@ -251,7 +250,7 @@ func TestDeleteSecretKey(t *testing.T) {
 
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
+		defer os.RemoveAll(dir)
 
 		ctx := newContext()
 
