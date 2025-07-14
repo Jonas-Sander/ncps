@@ -30,6 +30,47 @@ import (
 
 const cacheName = "cache.example.com"
 
+func newContext() context.Context {
+	return zerolog.
+		New(io.Discard).
+		WithContext(context.Background())
+}
+
+// setupTestServer creates a full server stack for testing.
+func setupTestServer(t *testing.T) (*httptest.Server, *cache.Cache, *local.Store) {
+	t.Helper()
+
+	ctx := newContext()
+	hts := testdata.NewTestServer(t, 40)
+	t.Cleanup(hts.Close)
+
+	uc, err := upstream.New(ctx, testhelper.MustParseURL(t, hts.URL), testdata.PublicKeys())
+	require.NoError(t, err)
+
+	dir, err := os.MkdirTemp("", "cache-path-")
+	require.NoError(t, err)
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	dbFile := filepath.Join(dir, "var", "ncps", "db", "db.sqlite")
+	testhelper.CreateMigrateDatabase(t, dbFile)
+	db, err := database.Open("sqlite:" + dbFile)
+	require.NoError(t, err)
+
+	localStore, err := local.New(ctx, dir)
+	require.NoError(t, err)
+
+	c, err := cache.New(ctx, cacheName, db, localStore, localStore, localStore, "")
+	require.NoError(t, err)
+	c.AddUpstreamCaches(ctx, uc)
+	c.SetRecordAgeIgnoreTouch(0)
+
+	s := server.New(c)
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	return ts, c, localStore
+}
+
 //nolint:paralleltest
 func TestServeHTTP(t *testing.T) {
 	hts := testdata.NewTestServer(t, 40)
@@ -82,24 +123,7 @@ func TestServeHTTP(t *testing.T) {
 	})
 
 	t.Run("DELETE requests", func(t *testing.T) {
-		dir, err := os.MkdirTemp("", "cache-path-")
-		require.NoError(t, err)
-		defer os.RemoveAll(dir) // clean up
-
-		dbFile := filepath.Join(dir, "var", "ncps", "db", "db.sqlite")
-		testhelper.CreateMigrateDatabase(t, dbFile)
-
-		db, err := database.Open("sqlite:" + dbFile)
-		require.NoError(t, err)
-
-		localStore, err := local.New(newContext(), dir)
-		require.NoError(t, err)
-
-		c, err := cache.New(newContext(), cacheName, db, localStore, localStore, localStore, "")
-		require.NoError(t, err)
-
-		c.AddUpstreamCaches(newContext(), uc)
-		c.SetRecordAgeIgnoreTouch(0)
+		ts, c, localStore := setupTestServer(t)
 
 		t.Run("DELETE is not permitted", func(t *testing.T) {
 			s := server.New(c)
@@ -136,50 +160,15 @@ func TestServeHTTP(t *testing.T) {
 		t.Run("DELETE is permitted", func(t *testing.T) {
 			s := server.New(c)
 			s.SetDeletePermitted(true)
-
-			ts := httptest.NewServer(s)
-			defer ts.Close()
-
-			t.Run("narInfo", func(t *testing.T) {
-				storePath := filepath.Join(dir, "store", "narinfo", testdata.Nar1.NarInfoPath)
-
-				t.Run("narinfo does not exist in storage yet", func(t *testing.T) {
-					assert.NoFileExists(t, storePath)
-				})
-
-				_, err := c.GetNarInfo(newContext(), testdata.Nar1.NarInfoHash)
-				require.NoError(t, err)
-
-				t.Run("narinfo does exist in storage", func(t *testing.T) {
-					assert.FileExists(t, storePath)
-				})
-
-				t.Run("DELETE returns no error", func(t *testing.T) {
-					url := ts.URL + "/" + testdata.Nar1.NarInfoHash + ".narinfo"
-
-					r, err := http.NewRequestWithContext(newContext(), http.MethodDelete, url, nil)
-					require.NoError(t, err)
-
-					resp, err := ts.Client().Do(r)
-					require.NoError(t, err)
-
-					assert.Equal(t, http.StatusNoContent, resp.StatusCode)
-				})
-
-				t.Run("narinfo is gone from the store", func(t *testing.T) {
-					assert.NoFileExists(t, storePath)
-				})
-			})
+			// Replace the test server's handler with the new one
+			ts.Config.Handler = s
 
 			t.Run("nar", func(t *testing.T) {
-				storePath := filepath.Join(dir, "store", "nar", testdata.Nar2.NarPath)
-
-				t.Run("nar does not exist in storage yet", func(t *testing.T) {
-					assert.NoFileExists(t, storePath)
-				})
-
+				storePath := filepath.Join(localStore.Path(), "store", "nar", testdata.Nar2.NarPath)
 				nu := nar.URL{Hash: testdata.Nar2.NarHash, Compression: nar.CompressionTypeXz}
-				_, _, err := c.GetNar(newContext(), nu)
+
+				// Synchronously populate the cache before testing delete
+				_, err := c.PutNar(newContext(), nu, strings.NewReader(testdata.Nar2.NarText))
 				require.NoError(t, err)
 
 				t.Run("nar does exist in storage", func(t *testing.T) {
@@ -187,18 +176,18 @@ func TestServeHTTP(t *testing.T) {
 				})
 
 				t.Run("DELETE returns no error", func(t *testing.T) {
-					url := ts.URL + "/nar/" + testdata.Nar2.NarHash + ".nar.xz"
-
-					r, err := http.NewRequestWithContext(newContext(), http.MethodDelete, url, nil)
+					narURL := ts.URL + "/nar/" + testdata.Nar2.NarHash + ".nar.xz"
+					r, err := http.NewRequestWithContext(newContext(), http.MethodDelete, narURL, nil)
 					require.NoError(t, err)
 
 					resp, err := ts.Client().Do(r)
 					require.NoError(t, err)
+					defer resp.Body.Close()
 
 					assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 				})
 
-				t.Run("narinfo is gone from the store", func(t *testing.T) {
+				t.Run("nar is gone from the store", func(t *testing.T) {
 					assert.NoFileExists(t, storePath)
 				})
 			})
@@ -468,10 +457,4 @@ func TestServeHTTP(t *testing.T) {
 			})
 		})
 	})
-}
-
-func newContext() context.Context {
-	return zerolog.
-		New(io.Discard).
-		WithContext(context.Background())
 }

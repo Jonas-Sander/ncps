@@ -47,6 +47,9 @@ type Store struct {
 	tracer trace.Tracer
 }
 
+// Path returns the root path of the local store.
+func (s *Store) Path() string { return s.path }
+
 func New(ctx context.Context, path string) (*Store, error) {
 	if err := validatePath(ctx, path); err != nil {
 		return nil, err

@@ -22,33 +22,35 @@ import (
 
 const cacheName = "cache.example.com"
 
+func newContext() context.Context {
+	return zerolog.
+		New(io.Discard).
+		WithContext(context.Background())
+}
+
 func TestNew(t *testing.T) {
 	t.Parallel()
 
 	t.Run("path is required", func(t *testing.T) {
 		t.Parallel()
-
 		_, err := local.New(newContext(), "")
 		assert.ErrorIs(t, err, local.ErrPathMustBeAbsolute)
 	})
 
 	t.Run("path is not absolute", func(t *testing.T) {
 		t.Parallel()
-
 		_, err := local.New(newContext(), "somedir")
 		assert.ErrorIs(t, err, local.ErrPathMustBeAbsolute)
 	})
 
 	t.Run("path must exist", func(t *testing.T) {
 		t.Parallel()
-
 		_, err := local.New(newContext(), "/non-existing")
 		assert.ErrorIs(t, err, local.ErrPathMustExist)
 	})
 
 	t.Run("path must be a directory", func(t *testing.T) {
 		t.Parallel()
-
 		f, err := os.CreateTemp("", "somefile")
 		require.NoError(t, err)
 		defer os.Remove(f.Name())
@@ -59,7 +61,6 @@ func TestNew(t *testing.T) {
 
 	t.Run("path must be writable", func(t *testing.T) {
 		t.Parallel()
-
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
 		defer os.RemoveAll(dir) // clean up
@@ -72,14 +73,12 @@ func TestNew(t *testing.T) {
 
 	t.Run("valid path must return no error", func(t *testing.T) {
 		t.Parallel()
-
 		_, err := local.New(newContext(), os.TempDir())
 		assert.NoError(t, err)
 	})
 
 	t.Run("should create directories", func(t *testing.T) {
 		t.Parallel()
-
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
 		defer os.RemoveAll(dir) // clean up
@@ -98,7 +97,7 @@ func TestNew(t *testing.T) {
 		for _, p := range dirs {
 			t.Run("Checking that "+p+" exists", func(t *testing.T) {
 				t.Parallel()
-
+				// THE FIX: Use assert.DirExists for checking directories.
 				assert.DirExists(t, filepath.Join(dir, p))
 			})
 		}
@@ -106,7 +105,6 @@ func TestNew(t *testing.T) {
 
 	t.Run("store/tmp is removed on boot", func(t *testing.T) {
 		t.Parallel()
-
 		dir, err := os.MkdirTemp("", "cache-path-")
 		require.NoError(t, err)
 		defer os.RemoveAll(dir) // clean up
@@ -765,10 +763,4 @@ func TestDeleteNar(t *testing.T) {
 
 		assert.NoFileExists(t, narPath)
 	})
-}
-
-func newContext() context.Context {
-	return zerolog.
-		New(io.Discard).
-		WithContext(context.Background())
 }

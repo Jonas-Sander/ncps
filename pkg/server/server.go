@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -378,16 +379,10 @@ func (s *Server) getNar(withBody bool) http.HandlerFunc {
 
 		nu := nar.URL{Hash: hash, Query: r.URL.Query()}
 
-		r = r.WithContext(
-			nu.NewLogger(*zerolog.Ctx(r.Context())).
-				WithContext(r.Context()))
-
 		var err error
-
 		nu.Compression, err = nar.CompressionTypeFromExtension(chi.URLParam(r, "compression"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
-
 			return
 		}
 
@@ -410,41 +405,39 @@ func (s *Server) getNar(withBody bool) http.HandlerFunc {
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-
 				return
 			}
-
-			zerolog.Ctx(r.Context()).
-				Error().
-				Err(err).
-				Msg("error fetching the nar")
-
+			zerolog.Ctx(r.Context()).Error().Err(err).Msg("error fetching the nar")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
-
 			return
 		}
+		defer reader.Close()
 
 		h := w.Header()
 		h.Set(contentType, contentTypeNar)
-		h.Set(contentLength, strconv.FormatInt(size, 10))
+		// If size is -1, it's a live stream and the server will use chunked encoding.
+		// Otherwise, we set the Content-Length for a known-size response from cache.
+		if size >= 0 {
+			h.Set(contentLength, strconv.FormatInt(size, 10))
+		}
 
 		if !withBody {
-			w.WriteHeader(http.StatusNoContent)
-
+			w.WriteHeader(http.StatusOK) // Use 200 OK for HEAD requests for compatibility
 			return
 		}
+
+		w.WriteHeader(http.StatusOK)
 
 		written, err := io.Copy(w, reader)
 		if err != nil {
-			zerolog.Ctx(r.Context()).
-				Error().
-				Err(err).
-				Msg("error writing the response")
-
+			// The client might have disconnected, which is not a server error.
+			if !errors.Is(err, context.Canceled) {
+				zerolog.Ctx(r.Context()).Error().Err(err).Msg("error writing the response")
+			}
 			return
 		}
 
-		if written != size {
+		if size >= 0 && written != size {
 			zerolog.Ctx(r.Context()).
 				Error().
 				Int64("expected", size).

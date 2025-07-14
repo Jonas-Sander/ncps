@@ -351,8 +351,9 @@ func (c *Cache) GetHostname() string { return c.hostName }
 // PublicKey returns the public key of the server.
 func (c *Cache) PublicKey() signature.PublicKey { return c.secretKey.ToPublicKey() }
 
-// GetNar serves a NAR from the cache. If it's not present, it checks if a
-// download job is in progress and waits for it. It does NOT initiate downloads.
+// GetNar serves a NAR from the cache. If it's not present, it will initiate a
+// download from an upstream and stream it to the first client, while caching it
+// to disk. Subsequent clients will wait for the download to complete.
 func (c *Cache) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadCloser, error) {
 	ctx, span := c.tracer.Start(
 		ctx,
@@ -366,31 +367,83 @@ func (c *Cache) GetNar(ctx context.Context, narURL nar.URL) (int64, io.ReadClose
 
 	// Happy path: file is already in our store.
 	if c.narStore.HasNar(ctx, narURL) {
+		zerolog.Ctx(ctx).Info().Msg("NAR found in cache, serving from store.")
 		return c.getNarFromStore(ctx, &narURL)
 	}
 
-	// File is not in the store. Check if a download job is running for it.
 	c.muUpstreamJobs.Lock()
-	// NOTE: We check for a job by NAR hash, as this is what GetNar receives.
-	jobDoneC, jobInProgress := c.upstreamJobs[narURL.Hash]
-	c.muUpstreamJobs.Unlock()
+	doneC, jobInProgress := c.upstreamJobs[narURL.Hash]
 
 	if jobInProgress {
+		// Follower path: A download is already in progress. Wait for it to finish.
+		c.muUpstreamJobs.Unlock()
 		zerolog.Ctx(ctx).Info().Msg("NAR not in store, but download is in progress. Waiting...")
 		select {
-		case <-jobDoneC:
+		case <-doneC:
 			zerolog.Ctx(ctx).Info().Msg("In-progress NAR download finished. Now serving from store.")
-			// The job is done, the file should be in the store now.
 			return c.getNarFromStore(ctx, &narURL)
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
 		}
 	}
 
-	// Not in store and no job is running. This implies a client asked for a NAR
-	// for which a narinfo was never requested.
-	zerolog.Ctx(ctx).Warn().Msg("Requested NAR not in cache and no download job is in progress.")
-	return 0, nil, storage.ErrNotFound
+	// Leader path: No download in progress. We are the first.
+	// We'll start the download and stream to this client.
+	zerolog.Ctx(ctx).Info().Msg("NAR not in store. Initiating streaming download.")
+	pipeReader, pipeWriter := io.Pipe()
+	doneC = make(chan struct{})
+	c.upstreamJobs[narURL.Hash] = doneC
+	c.muUpstreamJobs.Unlock()
+
+	// Use a detached context for the background download.
+	detachedCtx := trace.ContextWithSpan(
+		zerolog.Ctx(ctx).WithContext(c.baseContext),
+		trace.SpanFromContext(ctx),
+	)
+
+	go c.streamAndStoreNar(detachedCtx, &narURL, pipeWriter, doneC)
+
+	// Return the reader end of the pipe immediately to the client.
+	// We don't know the content length, so return -1.
+	// The HTTP server will use chunked encoding.
+	return -1, pipeReader, nil
+}
+
+// streamAndStoreNar is the background worker for the "leader" client.
+// It downloads the NAR, streams it to the pipeWriter (for the client),
+// and simultaneously saves it to the narStore.
+func (c *Cache) streamAndStoreNar(ctx context.Context, narURL *nar.URL, pipeWriter *io.PipeWriter, doneC chan struct{}) {
+	// IMPORTANT: This defer block ensures the job is cleaned up and followers are unblocked.
+	defer func() {
+		close(doneC)
+		c.muUpstreamJobs.Lock()
+		delete(c.upstreamJobs, narURL.Hash)
+		c.muUpstreamJobs.Unlock()
+	}()
+
+	resp, _, _, err := c.initiateNarDownloadFromUpstream(ctx, narURL, nil, nil, false)
+	if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("failed to initiate NAR download")
+		pipeWriter.CloseWithError(err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// We can now close the writer side of the pipe when the copy is done.
+	// This will signal EOF to the client who is reading from the reader side.
+	// We must do this *after* the TeeReader is done.
+	defer pipeWriter.Close()
+
+	// TeeReader sends all reads from resp.Body to both the pipeWriter and the narStore.
+	teeReader := io.TeeReader(resp.Body, pipeWriter)
+
+	// PutNar will now read from the teeReader, effectively writing to disk while feeding the pipe.
+	if _, err := c.narStore.PutNar(ctx, *narURL, teeReader); err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("failed to store NAR while streaming")
+		// The error from storing shouldn't break the client's stream if it's still active.
+		// The pipe will be closed by the defer, but we won't propagate this specific storage error
+		// to the client via the pipe, as they might have already received the full file.
+	}
 }
 
 // PutNar records the NAR (given as an io.Reader) into the store.
@@ -412,9 +465,6 @@ func (c *Cache) PutNar(ctx context.Context, narURL nar.URL, r io.Reader) (int64,
 		NewLogger(*zerolog.Ctx(ctx)).
 		WithContext(ctx)
 
-	// Since r is an io.Reader, not an io.ReadCloser, we don't need to close it.
-	// But if the caller passes an io.ReadCloser, it's their responsibility to close it.
-	// We'll just read from it.
 	written, err := c.narStore.PutNar(ctx, narURL, r)
 
 	return written, err
@@ -440,6 +490,39 @@ func (c *Cache) DeleteNar(ctx context.Context, narURL nar.URL) error {
 		WithContext(ctx)
 
 	return c.narStore.DeleteNar(ctx, narURL)
+}
+
+// pullNar is the background worker that handles downloading and storing a NAR.
+func (c *Cache) pullNar(
+	ctx context.Context,
+	narURL *nar.URL,
+	uc *upstream.Cache,
+	narInfo *narinfo.NarInfo,
+	enableZSTD bool,
+	doneC chan struct{},
+) {
+	// This defer is critical. It signals completion to all waiters.
+	defer close(doneC)
+
+	ctx, span := c.tracer.Start(
+		ctx,
+		"cache.pullNar",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String("nar_url", narURL.String())),
+	)
+	defer span.End()
+
+	zerolog.Ctx(ctx).Info().Msg("Starting NAR pull from upstream.")
+
+	resp, _, updatedNarInfo, err := c.initiateNarDownloadFromUpstream(ctx, narURL, uc, narInfo, enableZSTD)
+	if err != nil {
+		zerolog.Ctx(ctx).Error().Err(err).Msg("Failed to download NAR from upstream")
+		return
+	}
+
+	// We have the stream, now store it.
+	// This function handles closing the response body.
+	c.storeNarFromStream(ctx, narURL, resp.Body, updatedNarInfo)
 }
 
 func (c *Cache) getNarFromStore(
@@ -572,13 +655,12 @@ func (c *Cache) GetNarInfo(ctx context.Context, hash string) (*narinfo.NarInfo, 
 	return c.narInfoStore.GetNarInfo(ctx, hash)
 }
 
-// pullNarInfo is the background job to fetch narinfo and its corresponding NAR.
+// GetNarInfo is updated to trigger a non-blocking NAR download in the background.
 func (c *Cache) pullNarInfo(
 	ctx context.Context,
 	hash string,
 	doneC chan struct{},
 ) {
-	// This defer is critical. It signals completion to all waiters.
 	defer close(doneC)
 
 	ctx, span := c.tracer.Start(
@@ -603,40 +685,15 @@ func (c *Cache) pullNarInfo(
 		return
 	}
 
-	// This NAR download job needs its own lock and channel to handle concurrent `GetNar` requests.
-	c.muUpstreamJobs.Lock()
-	narDoneC, narJobInProgress := c.upstreamJobs[narURL.Hash]
-	if !narJobInProgress {
-		narDoneC = make(chan struct{})
-		c.upstreamJobs[narURL.Hash] = narDoneC
-	}
-	c.muUpstreamJobs.Unlock()
+	// The narinfo has been successfully fetched. Now, we ensure the
+	// corresponding NAR is also downloaded in the background. We do not wait for it.
+	enableZSTD := narInfo.Compression == nar.CompressionTypeNone.String()
+	detachedCtx := trace.ContextWithSpan(zerolog.Ctx(ctx).WithContext(c.baseContext), trace.SpanFromContext(ctx))
+	narDoneC := c.prePullNar(detachedCtx, &narURL, uc, narInfo, enableZSTD)
 
-	// If another job is already downloading this NAR, we don't need to do it again.
-	// But we must still wait for it to finish before we store our narinfo,
-	// in case the file size changes (e.g., ZSTD compression).
-	if narJobInProgress {
-		zerolog.Ctx(ctx).Info().Str("nar_hash", narURL.Hash).Msg("NAR download already in progress, waiting.")
-		<-narDoneC
-	} else {
-		// We are the leader for this NAR download.
-		defer func() {
-			c.muUpstreamJobs.Lock()
-			delete(c.upstreamJobs, narURL.Hash)
-			c.muUpstreamJobs.Unlock()
-			close(narDoneC)
-		}()
-
-		enableZSTD := narInfo.Compression == nar.CompressionTypeNone.String()
-		detachedCtx := trace.ContextWithSpan(zerolog.Ctx(ctx).WithContext(c.baseContext), trace.SpanFromContext(ctx))
-
-		resp, _, updatedNarInfo, err := c.initiateNarDownloadFromUpstream(detachedCtx, &narURL, uc, narInfo, enableZSTD)
-		if err != nil {
-			zerolog.Ctx(ctx).Error().Err(err).Msg("failed to download associated NAR")
-		} else {
-			c.storeNarFromStream(detachedCtx, &narURL, resp.Body, updatedNarInfo)
-		}
-	}
+	// IMPORTANT: We must wait for the NAR download to finish *before* storing the narinfo,
+	// because the download process might update the narinfo (e.g., FileSize after ZSTD compression).
+	<-narDoneC
 
 	if err := c.signNarInfo(ctx, hash, narInfo); err != nil {
 		zerolog.Ctx(ctx).Error().Err(err).Msg("error signing narinfo")
@@ -745,6 +802,37 @@ func (c *Cache) prePullNarInfo(ctx context.Context, hash string) chan struct{} {
 		c.upstreamJobs[hash] = doneC
 
 		go c.pullNarInfo(ctx, hash, doneC)
+	}
+	c.muUpstreamJobs.Unlock()
+
+	return doneC
+}
+
+func (c *Cache) prePullNar(
+	ctx context.Context,
+	narURL *nar.URL,
+	uc *upstream.Cache,
+	narInfo *narinfo.NarInfo,
+	enableZSTD bool,
+) chan struct{} {
+	ctx, span := c.tracer.Start(
+		ctx,
+		"cache.prePullNar",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("nar_url", narURL.String()),
+		),
+	)
+	defer span.End()
+
+	c.muUpstreamJobs.Lock()
+
+	doneC, ok := c.upstreamJobs[narURL.Hash]
+	if !ok {
+		doneC = make(chan struct{})
+		c.upstreamJobs[narURL.Hash] = doneC
+
+		go c.pullNar(ctx, narURL, uc, narInfo, enableZSTD, doneC)
 	}
 	c.muUpstreamJobs.Unlock()
 
